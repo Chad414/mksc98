@@ -780,21 +780,23 @@ static int tick_title_menu_page(PortableFrontendFlow *flow, int direction, uint1
     /* Rows: single player, multiplayer, ghost exchange, then the
      * native-only Options row the platform shell opens itself. */
     const uint8_t title_before = flow->title_cursor;
-    if (direction == 0 && !move_clamped(flow, &flow->title_cursor, 4u, -1))
+    if (direction == 0 && !move_clamped(flow, &flow->title_cursor, PORTABLE_FRONTEND_TITLE_ROWS, -1))
         return 0;
-    if (direction == 1 && !move_clamped(flow, &flow->title_cursor, 4u, 1))
+    if (direction == 1 && !move_clamped(flow, &flow->title_cursor, PORTABLE_FRONTEND_TITLE_ROWS, 1))
         return 0;
     /* Source state25 consumes a changed cursor before considering confirm. */
     if (flow->title_cursor != title_before)
         return flow->event_overflow == 0u;
     if ((flow->triggered & confirm) != 0u && (flow->short_transitions || flow->page_ticks > 69u))
     {
+#ifndef MKSC_WIN98 /* no split-screen in the Windows 98 port: the row reports "unavailable" below */
         if (flow->title_cursor == 1u)
         {
             flow->player_count_open = 1u;
             flow->players = 2u;
             return emit_event(flow, PORTABLE_FRONTEND_EVENT_OPEN, flow->players);
         }
+#endif
         if (flow->title_cursor == 2u)
         {
             /* Ghost exchange is the Time Trial records ghost view

@@ -1,0 +1,550 @@
+--- a/portable/platform/file_replace.h
++++ b/portable/platform/file_replace.h
+@@ -11,7 +11,12 @@
+ static inline int portable_file_replace(const char *temporary,const char *path)
+ {
+     if(temporary==NULL||path==NULL)return 0;
+-#ifdef _WIN32
++#if defined(_WIN32) && defined(MKSC_WIN98)
++    /* Windows 9x exports MoveFileExA only as a stub that always fails. A
++     * plain move works for a first save; otherwise replace in two steps. */
++    if(MoveFileA(temporary,path))return 1;
++    return DeleteFileA(path)&&MoveFileA(temporary,path);
++#elif defined(_WIN32)
+     return MoveFileExA(temporary,path,MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)!=0;
+ #else
+     return rename(temporary,path)==0;
+--- a/portable/platform/software_frame.h
++++ b/portable/platform/software_frame.h
+@@ -28,7 +28,14 @@
+ } PortableSoftwareFrame;
+ 
+ static inline size_t portable_software_frame_scale(const PortableSoftwareFrame *frame)
++#ifdef PORTABLE_SOFTWARE_FRAME_NATIVE_ONLY
++/* Builds that only ever render at the native 240x160 sampling (internal
++ * scale 1) make the scale a constant, so every per-pixel multiply and
++ * 64-bit divide by it folds away in the renderers. */
++{ (void)frame; return 1u; }
++#else
+ { return frame->scale>1u?frame->scale:1u; }
++#endif
+ static inline size_t portable_software_frame_pixel_count(const PortableSoftwareFrame *frame)
+ { const size_t scale=portable_software_frame_scale(frame);return frame->width*frame->height*scale*scale; }
+ static inline size_t portable_software_frame_stride(const PortableSoftwareFrame *frame)
+--- a/portable/platform/frontend_image_renderer.c
++++ b/portable/platform/frontend_image_renderer.c
+@@ -2,6 +2,50 @@
+ #include "native_image.h"
+ #include "course_menu_renderer.h"
+ 
++/* Same result as the shared native-image pixel reader, kept in this file so the
++ * full-screen menu loops below fetch pixels without a call per pixel. */
++static inline uint32_t image_pixel(const PortableNativeImage *image,size_t x,size_t y)
++{
++    if(!image->pixels||x>=image->width||y>=image->height)return 0u;
++    const size_t offset=y*image->width+x;
++    if(!image->palette){
++        const uint8_t *p=image->pixels+offset*4u;
++        return (uint32_t)p[0]|(uint32_t)p[1]<<8|(uint32_t)p[2]<<16|(uint32_t)p[3]<<24;
++    }
++    const unsigned index=image->pixels[offset];
++    if(index==255u)return 0u;
++    const uint8_t *entry=image->palette+(index-image->palette_base)*2u;
++    const unsigned color=(unsigned)entry[0]|(unsigned)entry[1]<<8;
++    const unsigned r=color&31u,g=(color>>5u)&31u,b=(color>>10u)&31u;
++    return 0xff000000u|(r*8u+r/4u)<<16u|(g*8u+g/4u)<<8u|(b*8u+b/4u);
++}
++
++/* Full-screen passes read the same few palette entries tens of thousands of
++ * times: convert each entry once, on first use (entries an image never uses
++ * are never read, exactly as before). */
++typedef struct { const PortableNativeImage *image; uint32_t color[256]; uint8_t known[256]; } ImageLookup;
++static inline void image_lookup_init(ImageLookup *lookup,const PortableNativeImage *image)
++{
++    lookup->image=image;
++    for(unsigned i=0u;i<256u;++i)lookup->known[i]=0u;
++}
++static inline uint32_t image_lookup_pixel(ImageLookup *lookup,size_t x,size_t y)
++{
++    const PortableNativeImage *image=lookup->image;
++    if(!image->palette)return image_pixel(image,x,y);
++    if(!image->pixels||x>=image->width||y>=image->height)return 0u;
++    const unsigned index=image->pixels[y*image->width+x];
++    if(index==255u)return 0u;
++    if(!lookup->known[index]){
++        const uint8_t *entry=image->palette+(index-image->palette_base)*2u;
++        const unsigned color=(unsigned)entry[0]|(unsigned)entry[1]<<8;
++        const unsigned r=color&31u,g=(color>>5u)&31u,b=(color>>10u)&31u;
++        lookup->color[index]=0xff000000u|(r*8u+r/4u)<<16u|(g*8u+g/4u)<<8u|(b*8u+b/4u);
++        lookup->known[index]=1u;
++    }
++    return lookup->color[index];
++}
++
+ static PortableFrontendPresentationStatus draw_scaled_palette(
+     const PortableAssetPackView *pack, uint32_t id, PortableSoftwareFrame *frame,
+     int x, int y, int left, int top, int right, int bottom, unsigned scale,
+@@ -84,13 +128,37 @@
+     int bottom=(int)frame->height;if(bottom>160)bottom=160;
+     int clipped_right=(int)frame->width;if(clipped_right>240)clipped_right=240;
+     if(clipped_right>right)clipped_right=right;
+-    for(int dy=0;dy<bottom*output_scale;++dy)
+-    for(int dx=0;dx<clipped_right*output_scale;++dx){
++    /* Only target pixels within a circle around the pivot can sample inside
++     * the image: bound the scan by that circle's box instead of visiting the
++     * whole screen for every icon. The radius is the farthest image corner
++     * from the pivot, mapped through the inverse scale, with slack for the
++     * rounding below and for the sine table's unit error. */
++    int first_dx=0,first_dy=0,last_dx=clipped_right*output_scale,last_dy=bottom*output_scale;
++    {
++        int64_t farthest=0;
++        for(int corner=0;corner<4;++corner){
++            const int64_t u=(int64_t)image.anchor_x-pivot_x+((corner&1)?(int64_t)image.width:0);
++            const int64_t v=(int64_t)image.anchor_y-pivot_y+((corner&2)?(int64_t)image.height:0);
++            if(u*u+v*v>farthest)farthest=u*u+v*v;
++        }
++        int64_t radius=0;
++        while(radius*radius<farthest)++radius;
++        radius=((radius+3)*256*output_scale+inverse-1)/inverse;
++        radius+=radius/16+2*output_scale;
++        const int64_t center_x=(int64_t)(x+pivot_x)*output_scale,center_y=(int64_t)(y+pivot_y)*output_scale;
++        if(center_x-radius>first_dx)first_dx=(int)(center_x-radius);
++        if(center_y-radius>first_dy)first_dy=(int)(center_y-radius);
++        if(center_x+radius+1<last_dx)last_dx=(int)(center_x+radius+1);
++        if(center_y+radius+1<last_dy)last_dy=(int)(center_y+radius+1);
++    }
++    ImageLookup lookup;image_lookup_init(&lookup,&image);
++    for(int dy=first_dy;dy<last_dy;++dy)
++    for(int dx=first_dx;dx<last_dx;++dx){
+         int rx=dx-(x+pivot_x)*output_scale,ry=dy-(y+pivot_y)*output_scale;
+         int sx=pivot_x+portable_menu_asr15(((int64_t)rx*cosine+(int64_t)ry*sine)*inverse/(256*output_scale))-image.anchor_x;
+         int sy=pivot_y+portable_menu_asr15((-(int64_t)rx*sine+(int64_t)ry*cosine)*inverse/(256*output_scale))-image.anchor_y;
+         if(sx<0||sy<0||sx>=image.width||sy>=image.height)continue;
+-        const uint32_t pixel=portable_native_image_pixel(&image,(unsigned)sx,(unsigned)sy);
++        const uint32_t pixel=image_lookup_pixel(&lookup,(unsigned)sx,(unsigned)sy);
+         if((pixel>>24)==255u)portable_software_frame_store_physical(frame,(size_t)dx,(size_t)dy,pixel);
+     }
+     return PORTABLE_FRONTEND_PRESENTATION_OK;
+@@ -111,7 +179,7 @@
+         int dx=x+(int)sx,dy=y+(int)sy;
+         if(dx<left||dx>=right||dy<top||dy>=bottom||dx<0||dy<0||
+            (size_t)dx>=frame->width||(size_t)dy>=frame->height)continue;
+-        uint32_t pixel=portable_native_image_pixel(&image,sx,row*height+sy);
++        uint32_t pixel=image_pixel(&image,sx,row*height+sy);
+         if((pixel>>24)==255u)portable_software_frame_store(frame,(size_t)dy*frame->width+(unsigned)dx,pixel);
+     }
+     return PORTABLE_FRONTEND_PRESENTATION_OK;
+@@ -138,7 +206,7 @@
+         const unsigned row=layers->pattern->height==1792u?layers->pattern_row*256u:0u;
+         const unsigned x=(unsigned)portable_software_frame_floor_div(physical_x,scale);
+         const unsigned y=(unsigned)portable_software_frame_floor_div(physical_y,scale);
+-        pixel=portable_native_image_pixel(layers->pattern,
++        pixel=image_pixel(layers->pattern,
+             (x+(unsigned)layers->scroll_x)&255u,
+             row+((y+(unsigned)layers->scroll_y)&255u));
+     }
+@@ -148,7 +216,7 @@
+         const int64_t ty=112*256*(int64_t)scale-layers->affine_b*x+layers->affine_a*y;
+         const unsigned sx=(unsigned)portable_software_frame_floor_div(tx,256*(int64_t)scale)&255u;
+         const unsigned sy=(unsigned)portable_software_frame_floor_div(ty,256*(int64_t)scale)&255u;
+-        const uint32_t foreground=portable_native_image_pixel(layers->affine,sx,sy);
++        const uint32_t foreground=image_pixel(layers->affine,sx,sy);
+         if(foreground>>24u==255u)pixel=foreground;
+     }
+     return pixel;
+@@ -173,11 +241,12 @@
+     if(image.width!=256u||(image.height!=256u&&image.height!=256u*7u))return PORTABLE_FRONTEND_PRESENTATION_MISSING_SECTION;
+     const unsigned top=image.height==256u?0u:(row%7u)*256u;
+     const size_t center=frame->width>240u?(frame->width-240u)/2u:0u;
++    ImageLookup lookup;image_lookup_init(&lookup,&image);
+     for(unsigned y=0;y<160u;++y)for(size_t x=0;x<frame->width;++x){
+         /* Convert the centered source coordinate before wrapping: unsigned
+          * division would give the wrong left-side phase at odd scales. */
+         const unsigned source_x=(unsigned)((int64_t)x-(int64_t)center+offset_x)&255u;
+-        uint32_t pixel=portable_native_image_pixel(&image,source_x,top+((y+(unsigned)offset_y)&255u));
++        uint32_t pixel=image_lookup_pixel(&lookup,source_x,top+((y+(unsigned)offset_y)&255u));
+         if(pixel>>24!=255u)continue;
+         if(!additive_blend){portable_software_frame_store(frame,(size_t)y*frame->width+x,pixel);continue;}
+         /* Source BG0 blends8/16 over BG1 at16/16 in RGB555. */
+@@ -244,6 +313,21 @@
+     const int width=(int)frame->width*output_scale;
+     const int64_t center=(int64_t)(frame->width>240u?(frame->width-240u)/2u:0u)*output_scale;
+     const int height=(int)(frame->height<160u?frame->height:160u)*output_scale;
++    if(output_scale==1){
++        /* Native sampling: the same affine map as layers_sample_at(), stepped
++         * in 32-bit (every term is far below 2^31) with one add per pixel. An
++         * arithmetic shift by 8 is the floor division by 256 used there. */
++        ImageLookup lookup;image_lookup_init(&lookup,&image);
++        for(int y=0;y<height;++y){
++            const int32_t rx=(int32_t)(0-center)-200,ry=y-80;
++            int32_t tx=96*256+layers.affine_a*rx+layers.affine_b*ry;
++            int32_t ty=112*256-layers.affine_b*rx+layers.affine_a*ry;
++            for(int x=0;x<width;++x,tx+=layers.affine_a,ty-=layers.affine_b){
++                const uint32_t pixel=image_lookup_pixel(&lookup,(unsigned)(tx>>8)&255u,(unsigned)(ty>>8)&255u);
++                if(pixel>>24==255u)portable_software_frame_store_physical(frame,(size_t)x,(size_t)y,pixel);
++            }
++        }
++    }else
+     for(int y=0;y<height;++y)for(int x=0;x<width;++x){
+         const uint32_t pixel=portable_menu_background_layers_sample_at(&layers,(int64_t)x-center,y,(unsigned)output_scale);
+         if(pixel>>24==255u)portable_software_frame_store_physical(frame,(size_t)x,(size_t)y,pixel);
+@@ -294,7 +378,7 @@
+             const int sx=(int)portable_software_frame_floor_div((int64_t)(x-cell->x*scale)*cell->inverse_x,256*scale)-art.anchor_x;
+             const int sy=(int)portable_software_frame_floor_div((int64_t)(y-cell->y*scale)*cell->inverse_y,256*scale)-art.anchor_y;
+             if(sx<0||sy<0||(unsigned)sx>=art.width||(unsigned)sy>=art.height)continue;
+-            const uint32_t pixel=portable_native_image_pixel(&art,(unsigned)sx,(unsigned)sy);
++            const uint32_t pixel=image_pixel(&art,(unsigned)sx,(unsigned)sy);
+             if(pixel>>24u)portable_software_frame_store_physical(frame,(size_t)x,(size_t)y,pixel);
+         }
+     }
+--- a/portable/assets/asset_pack.c
++++ b/portable/assets/asset_pack.c
+@@ -342,6 +342,17 @@
+ {
+     if(pack==NULL||out==NULL||(pack->bytes==NULL&&pack->resolved_sections==NULL)||kind==0u||content_id==0u)
+         return PORTABLE_ASSET_PACK_INVALID_ARGUMENT;
++    /* Renderers look sections up per draw call. In a plain (uncomposed) pack
++     * compare the two key words in place and decode only the matching entry,
++     * instead of decoding every table entry on the way. */
++    if(pack->resolved_sections==NULL)
++    {
++        const uint8_t *entry=section_entry(pack,0u);
++        for(uint32_t index=0;index<pack->section_count;++index,entry+=PORTABLE_ASSET_PACK_SECTION_SIZE)
++            if(read_u32(entry)==kind&&read_u32(entry+4)==content_id)
++                return portable_asset_pack_section_at(pack,index,out);
++        return PORTABLE_ASSET_PACK_NOT_FOUND;
++    }
+     for(uint32_t index=0;index<pack->section_count;++index)
+     {
+         PortableAssetSectionView section;
+--- a/portable/platform/gp_race_host.c
++++ b/portable/platform/gp_race_host.c
+@@ -1673,7 +1673,13 @@
+         !route_audio_horn(host->configuration.audio))
+         host->error = 1;
+     if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat &&
+-        (event.key.scancode == SDL_SCANCODE_ESCAPE || event.key.scancode == SDL_SCANCODE_X))
++        (event.key.scancode == SDL_SCANCODE_ESCAPE || event.key.scancode == SDL_SCANCODE_X)
++#ifdef MKSC_WIN98
++        /* X is the port's "B" key: it must not drop a live race back to the
++         * menu. It still stops a replay; a race is left through the pause menu. */
++        && (event.key.scancode != SDL_SCANCODE_X || host->configuration.playback)
++#endif
++        )
+     {
+         if (host->configuration.quick_run && host->configuration.playback &&
+             host->configuration.recording != NULL)
+--- a/portable/app/frontend_flow.h
++++ b/portable/app/frontend_flow.h
+@@ -11,6 +11,14 @@
+ 
+ #define PORTABLE_FRONTEND_DRIVER_SLOTS 9u /* One 3x3 page; slot 4 is Random. */
+ #define PORTABLE_FRONTEND_DRIVER_PAGES 8u /* Stock page plus seven roster pages. */
++/* Title menu rows: single player, multiplayer, ghost exchange and the
++ * native-only Options row. The Windows 98 port, which has no window frame
++ * in fullscreen, adds a fifth: Quit. */
++#ifdef MKSC_WIN98
++#define PORTABLE_FRONTEND_TITLE_ROWS 5u
++#else
++#define PORTABLE_FRONTEND_TITLE_ROWS 4u
++#endif
+ #define PORTABLE_FRONTEND_DRIVER_CAPACITY \
+     (PORTABLE_FRONTEND_DRIVER_SLOTS * PORTABLE_FRONTEND_DRIVER_PAGES)
+ #define PORTABLE_FRONTEND_RANDOM_SLOT 4u
+--- a/portable/app/frontend_flow.c
++++ b/portable/app/frontend_flow.c
+@@ -780,21 +780,23 @@
+     /* Rows: single player, multiplayer, ghost exchange, then the
+      * native-only Options row the platform shell opens itself. */
+     const uint8_t title_before = flow->title_cursor;
+-    if (direction == 0 && !move_clamped(flow, &flow->title_cursor, 4u, -1))
++    if (direction == 0 && !move_clamped(flow, &flow->title_cursor, PORTABLE_FRONTEND_TITLE_ROWS, -1))
+         return 0;
+-    if (direction == 1 && !move_clamped(flow, &flow->title_cursor, 4u, 1))
++    if (direction == 1 && !move_clamped(flow, &flow->title_cursor, PORTABLE_FRONTEND_TITLE_ROWS, 1))
+         return 0;
+     /* Source state25 consumes a changed cursor before considering confirm. */
+     if (flow->title_cursor != title_before)
+         return flow->event_overflow == 0u;
+     if ((flow->triggered & confirm) != 0u && (flow->short_transitions || flow->page_ticks > 69u))
+     {
++#ifndef MKSC_WIN98 /* no split-screen in the Windows 98 port: the row reports "unavailable" below */
+         if (flow->title_cursor == 1u)
+         {
+             flow->player_count_open = 1u;
+             flow->players = 2u;
+             return emit_event(flow, PORTABLE_FRONTEND_EVENT_OPEN, flow->players);
+         }
++#endif
+         if (flow->title_cursor == 2u)
+         {
+             /* Ghost exchange is the Time Trial records ghost view
+--- a/portable/platform/title_renderer.c
++++ b/portable/platform/title_renderer.c
+@@ -200,7 +200,7 @@
+         }
+     }
+ 
+-    if (flow->title_cursor>=4u) return PORTABLE_FRONTEND_PRESENTATION_INVALID_ARGUMENT;
++    if (flow->title_cursor>=PORTABLE_FRONTEND_TITLE_ROWS) return PORTABLE_FRONTEND_PRESENTATION_INVALID_ARGUMENT;
+     if (flow->player_count_open) {
+         /* Local player count in the link sub-menu frame: the spm N-P tab,
+          * with the title's blinking arrows while more or fewer are possible. */
+@@ -231,12 +231,13 @@
+     }
+     /* The native-only fourth row has no ROM label; it uses the menu font. */
+     if (flow->title_cursor==3u) portable_menu_text_centered(pack,frame,120,124,"OPTIONS");
++    if (flow->title_cursor==4u) portable_menu_text_centered(pack,frame,120,124,"QUIT");
+     if ((flow->tick&0x2fu)<=0x1fu) {
+         if (flow->title_cursor>0u) {
+             status=title_chrome_draw(pack,flow,PORTABLE_TITLE_UP,1u,frame,120,125,40,117,200,147);
+             if (status!=PORTABLE_FRONTEND_PRESENTATION_OK) return status;
+         }
+-        if (flow->title_cursor<3u)
++        if (flow->title_cursor+1u<PORTABLE_FRONTEND_TITLE_ROWS)
+             status=title_chrome_draw(pack,flow,PORTABLE_TITLE_DOWN,2u,frame,120,147,40,117,200,160);
+     }
+     return status;
+--- a/portable/platform/game_host.c
++++ b/portable/platform/game_host.c
+@@ -54,6 +54,39 @@
+ 
+ /* Native options are a shell overlay: they do not advance game state or
+  * append original frontend events while the player edits preferences. */
++#ifdef MKSC_WIN98
++/* The Windows 98 port lists only what does something there. Row 5 keeps the
++ * deadzone field's slot because that row is the door to the key bindings;
++ * with no controller it is shown as "KEY BINDINGS" and has no value to step. */
++static const PortableSetting option_fields[] = {PORTABLE_SETTING_WINDOW_SCALE,
++                                                PORTABLE_SETTING_FULLSCREEN,
++                                                PORTABLE_SETTING_FIT_SCALING,
++                                                PORTABLE_SETTING_ASPECT_WIDTH,
++                                                PORTABLE_SETTING_VOLUME,
++                                                PORTABLE_SETTING_DEADZONE,
++                                                PORTABLE_SETTING_SHORT_TRANSITIONS,
++                                                PORTABLE_SETTING_INPUT_DISPLAY,
++                                                PORTABLE_SETTING_MIRROR,
++                                                PORTABLE_SETTING_FIX_DOPPLER_WRAP};
++#define OPTION_LABELS \
++    "WINDOW SCALE", "FULLSCREEN", "DISPLAY SCALING", "ASPECT RATIO", "MASTER VOLUME", \
++    "KEY BINDINGS", "FAST MENUS", "INPUT DISPLAY", "MIRROR MODE", "FIX DOPPLER BUG"
++#define OPTION_FOOTER_BINDINGS "Z/ENTER EDIT KEYS - X BACK"
++#define OPTION_FOOTER "X BACK - CHANGES SAVE AUTOMATICALLY"
++/* The Enhancements, Mods and in-race Graphics pages hold only features this
++ * port leaves out, so they are not reachable. */
++#define SHELL_EXTRA_PAGES 0
++#define SHELL_GRAPHICS_HOOK(shell) {0}
++#else
++#define OPTION_LABELS \
++        "WINDOW SCALE",  "FULLSCREEN",     "VSYNC",           "FILTER", \
++        "MASTER VOLUME", "STICK DEADZONE", "FAST MENUS",      "INTERPOLATION", \
++        "RENDER FPS",    "INTERNAL SCALE", "DISPLAY SCALING", "ASPECT RATIO", \
++        "RUMBLE",        "INPUT DISPLAY",  "MIRROR MODE",     "FIX DOPPLER BUG", "TOUCH CONTROLS"
++#define OPTION_FOOTER_BINDINGS "A/ENTER EDIT BINDINGS - B/ESC BACK"
++#define OPTION_FOOTER "B/ESC BACK - CHANGES SAVE AUTOMATICALLY"
++#define SHELL_EXTRA_PAGES 1
++#define SHELL_GRAPHICS_HOOK(shell) {shell, game_shell_graphics_current, game_shell_graphics_edit}
+ static const PortableSetting option_fields[] = {PORTABLE_SETTING_WINDOW_SCALE,
+                                                 PORTABLE_SETTING_FULLSCREEN,
+                                                 PORTABLE_SETTING_VSYNC,
+@@ -71,6 +104,7 @@
+                                                 PORTABLE_SETTING_MIRROR,
+                                                 PORTABLE_SETTING_FIX_DOPPLER_WRAP,
+                                                 PORTABLE_SETTING_TOUCH_CONTROLS};
++#endif
+ enum
+ {
+     OPTION_ROWS = sizeof option_fields / sizeof option_fields[0]
+@@ -78,11 +112,7 @@
+ static void render_settings(const PortableAssetPackView *pack, PortableSoftwareFrame *frame,
+                             const PortableSettings *settings, unsigned cursor, const char *notice)
+ {
+-    static const char *const labels[OPTION_ROWS] = {
+-        "WINDOW SCALE",  "FULLSCREEN",     "VSYNC",           "FILTER",
+-        "MASTER VOLUME", "STICK DEADZONE", "FAST MENUS",      "INTERPOLATION",
+-        "RENDER FPS",    "INTERNAL SCALE", "DISPLAY SCALING", "ASPECT RATIO",
+-        "RUMBLE",        "INPUT DISPLAY",  "MIRROR MODE",     "FIX DOPPLER BUG", "TOUCH CONTROLS"};
++    static const char *const labels[OPTION_ROWS] = {OPTION_LABELS};
+     const unsigned first = cursor >= PORTABLE_OPTION_PAGE_ROWS ? cursor - PORTABLE_OPTION_PAGE_ROWS + 1u : 0u;
+     portable_option_page(pack, frame, "OPTIONS", first, PORTABLE_OPTION_PAGE_ROWS, OPTION_ROWS);
+     for (unsigned line = 0u; line < PORTABLE_OPTION_PAGE_ROWS; ++line)
+@@ -91,13 +121,16 @@
+         const PortableSetting field = option_fields[row];
+         char value[24];
+         portable_option_value_text(settings, field, value);
++#ifdef MKSC_WIN98
++        if (field == PORTABLE_SETTING_DEADZONE) value[0] = '\0'; /* the key bindings row */
++#endif
+         portable_option_row(pack, frame, line, row == cursor, labels[row], value);
+     }
+     portable_menu_text_wrapped(pack, frame, 12, PORTABLE_OPTION_FOOTER_Y, 27u, PORTABLE_OPTION_ROW_STEP, 2u,
+                                notice != NULL ? notice
+                                : cursor == PORTABLE_SETTING_DEADZONE
+-                                   ? "A/ENTER EDIT BINDINGS - B/ESC BACK"
+-                                   : "B/ESC BACK - CHANGES SAVE AUTOMATICALLY");
++                                   ? OPTION_FOOTER_BINDINGS
++                                   : OPTION_FOOTER);
+ }
+ 
+ static void render_enhancements(const PortableAssetPackView *pack,PortableSoftwareFrame *frame,
+@@ -172,8 +205,14 @@
+ /* Binding rows: player 1 keys, player 2 keys, then gamepad buttons. */
+ enum
+ {
++#ifdef MKSC_WIN98
++    /* One keyboard player, no controller: just the eight player 1 keys. */
++    BINDING_ROWS = 8u,
++    BINDING_KEY_ROWS = 8u
++#else
+     BINDING_ROWS = 20u,
+     BINDING_KEY_ROWS = 16u
++#endif
+ };
+ static PortableSetting binding_field(unsigned row)
+ {
+@@ -232,9 +271,14 @@
+     portable_menu_text_wrapped(pack, frame, 12, PORTABLE_OPTION_FOOTER_Y, 27u, PORTABLE_OPTION_ROW_STEP, 2u,
+                                notice != NULL ? notice
+                                : capturing
++#ifdef MKSC_WIN98
++                                   ? "PRESS THE NEW KEY"
++                                   : "Z/ENTER CHANGE - TAB RESET - X BACK");
++#else
+                                    ? (cursor < BINDING_KEY_ROWS ? "PRESS A KEY - ESC CANCEL"
+                                                                 : "PRESS PAD BUTTON - START CANCEL")
+                                    : "B/ESC BACK - SELECT/TAB RESET THIS BINDING");
++#endif
+ }
+ 
+ /* The modern menus animate their own entrances, so they skip the original
+@@ -3365,7 +3409,7 @@
+         }
+         if (event.type == SDL_EVENT_KEY_DOWN || event.type == SDL_EVENT_KEY_UP)
+             frontend_keyboard_event(&event.key, &shell->keyboard_buttons, &shell->keyboard_pressed);
+-        if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat && event.key.key == SDLK_F5 && !shell->store_open &&
++        if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat && event.key.key == SDLK_F5 && SHELL_EXTRA_PAGES && !shell->store_open &&
+             !shell->binding_capture && shell->mod_dialog == NULL && !shell->mod_unsaved_open &&
+             !portable_course_3d_host_active(shell->preview_3d) &&
+             shell->options_open != 5) {
+@@ -4421,7 +4465,7 @@
+         }
+         shell->mesh_driving_pressed = 0u;
+         portable_course_3d_host_set_graphics(shell->preview_3d,
+-            (PortableGraphicsHook){shell, game_shell_graphics_current, game_shell_graphics_edit});
++            (PortableGraphicsHook)SHELL_GRAPHICS_HOOK(shell));
+         if (!mesh_request)
+             portable_course_3d_host_show(shell->preview_3d);
+         else if (!portable_course_3d_host_launch(shell->preview_3d, course, explore))
+@@ -4446,6 +4490,20 @@
+         shell->options_cursor = 0u;
+         shell->options_notice = NULL;
+     }
++#ifdef MKSC_WIN98
++    /* The port's fifth title row: leave the game the same way the window's
++     * close button does (saves are already written as they change). */
++    if (!shell->options_open && shell->aid == NULL &&
++        shell->flow.page == PORTABLE_FRONTEND_PAGE_TITLE_MENU &&
++        shell->flow.transition_ticks == 0u &&
++        (shell->flow.short_transitions || shell->flow.page_ticks > 69u) &&
++        shell->flow.title_cursor == 4u &&
++        (pressed & (PORTABLE_FRONTEND_BUTTON_A | PORTABLE_FRONTEND_BUTTON_START)))
++    {
++        game_shell_mod_exit(shell, 3u);
++        return GAME_SHELL_TICK_OPTIONS;
++    }
++#endif
+     /* The modern options show their pages as tabs: L and R switch between them. */
+     if (((shell->options_open >= 1 && shell->options_open <= 4)||shell->options_open==7) && !shell->binding_capture &&
+         shell->game_import==NULL &&
+@@ -4574,7 +4632,7 @@
+                 shell->options_notice = portable_ui_background_host_notice(&shell->ui_background);
+             }
+         }
+-        else if (pressed & PORTABLE_FRONTEND_BUTTON_SELECT)
++        else if (SHELL_EXTRA_PAGES && (pressed & PORTABLE_FRONTEND_BUTTON_SELECT))
+         {
+             shell->options_open = 3;
+             shell->enhancements_cursor=0u;
+@@ -4606,7 +4664,10 @@
+             const PortableSetting field = option_fields[shell->options_cursor];
+             const int delta = (pressed & PORTABLE_FRONTEND_BUTTON_LEFT) ? -1 : 1;
+             const int old = (int)portable_setting_get(&shell->settings, field);
+-            const int value = portable_option_step(field, old, delta);
++            int value = portable_option_step(field, old, delta);
++#ifdef MKSC_WIN98
++            if (field == PORTABLE_SETTING_DEADZONE) value = -1; /* the key bindings row has nothing to step */
++#endif
+             if (value >= 0)
+                 (void)game_shell_commit_setting(shell, field, (uint32_t)value, &shell->options_notice);
+         }
+@@ -5124,7 +5185,7 @@
+                                         shell->settings.aspect_width,
+                                         shell->settings.render_fps,
+                                         shell->settings.interpolate,
+-                                        {shell, game_shell_graphics_current, game_shell_graphics_edit}};
++                                        SHELL_GRAPHICS_HOOK(shell)};
+         for (unsigned player = 0u; player < shell->flow.players; ++player)
+             multi.characters[player] = shell->flow.player_characters[player];
+         if (!route_audio_begin_race(
+@@ -5292,7 +5353,7 @@
+                 (uint8_t)!shell->settings.classic_menus,
+                 shell->settings.artwork_lod,
+                 shell->settings.race_renderer,
+-                {shell, game_shell_graphics_current, game_shell_graphics_edit}};
++                SHELL_GRAPHICS_HOOK(shell)};
+             if (shell->aid != NULL)
+             {
+                 printf("%s menu launch: cup=%u class=%u track=%u course=%u credits=%u\n",
+@@ -5354,7 +5415,7 @@
+         shell->selected_trial->scene.save_directory =
+             shell->aid != NULL ? shell->aid->save_directory : NULL;
+         shell->selected_trial->scene.scripts = shell->scripts;
+-        shell->selected_trial->scene.graphics = (PortableGraphicsHook){shell, game_shell_graphics_current, game_shell_graphics_edit};
++        shell->selected_trial->scene.graphics = (PortableGraphicsHook)SHELL_GRAPHICS_HOOK(shell);
+         shell->selected_trial->host = portable_time_trial_host_begin(&shell->selected_trial->scene);
+         if (shell->selected_trial->host == NULL)
+         {
+@@ -5371,12 +5432,12 @@
+ 
+ static void modern_options(const GameShell *shell, ModernMenuOptions *options)
+ {
+-    static const char *const labels[OPTION_ROWS] = {
++    static const char *const labels[] = {
+         "Window Scale",  "Fullscreen",     "VSync",          "Filter",
+         "Master Volume", "Stick Deadzone", "Fast Menus",     "Interpolation",
+         "Render FPS",    "Internal Scale", "Display Scaling", "Aspect Ratio",
+         "Rumble",        "Input Display",  "Mirror Mode",    "Fix Doppler Bug", "Touch Controls"};
+-    static const char *const help[OPTION_ROWS] = {
++    static const char *const help[] = {
+         "Window size as a multiple of the original 240x160 screen.",
+         "Fill the whole display.",
+         "Sync presentation to the display to avoid tearing.",
+--- a/portable/platform/graphics_options.c
++++ b/portable/platform/graphics_options.c
+@@ -39,6 +39,12 @@
+             if (aspects[i] == old_value)
+                 index = i;
+         value = aspects[(index + delta + 4) % 4];
++#ifdef MKSC_WIN98
++        /* Two choices in the Windows 98 port: the original 240x160 picture,
++         * or (stored as 0, upstream's "auto") the picture that fills the
++         * screen at a whole scale: wider and, in races, taller. */
++        value = old_value == 240 ? 0 : 240;
++#endif
+     }
+     return value;
+ }
+@@ -48,6 +54,13 @@
+     const uint32_t number = portable_setting_get(settings, field);
+     if (field == PORTABLE_SETTING_ASPECT_WIDTH)
+     {
++#ifdef MKSC_WIN98
++        if (number == 240u)
++            snprintf(value, 24u, "ORIGINAL");
++        else if (number == 0u)
++            snprintf(value, 24u, "FILL");
++        else
++#endif
+         if (number == 240u)
+             snprintf(value, 24u, "3:2");
+         else if (number == 284u)

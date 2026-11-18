@@ -1,0 +1,6 @@
+# Build trees and outputs. build/ also holds packs imported from the ROM,
+# which must never be committed or published.
+build/
+out/
+*.gba
+*.pack

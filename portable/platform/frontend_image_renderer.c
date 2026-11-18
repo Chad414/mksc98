@@ -2,6 +2,50 @@
 #include "native_image.h"
 #include "course_menu_renderer.h"
 
+/* Same result as the shared native-image pixel reader, kept in this file so the
+ * full-screen menu loops below fetch pixels without a call per pixel. */
+static inline uint32_t image_pixel(const PortableNativeImage *image,size_t x,size_t y)
+{
+    if(!image->pixels||x>=image->width||y>=image->height)return 0u;
+    const size_t offset=y*image->width+x;
+    if(!image->palette){
+        const uint8_t *p=image->pixels+offset*4u;
+        return (uint32_t)p[0]|(uint32_t)p[1]<<8|(uint32_t)p[2]<<16|(uint32_t)p[3]<<24;
+    }
+    const unsigned index=image->pixels[offset];
+    if(index==255u)return 0u;
+    const uint8_t *entry=image->palette+(index-image->palette_base)*2u;
+    const unsigned color=(unsigned)entry[0]|(unsigned)entry[1]<<8;
+    const unsigned r=color&31u,g=(color>>5u)&31u,b=(color>>10u)&31u;
+    return 0xff000000u|(r*8u+r/4u)<<16u|(g*8u+g/4u)<<8u|(b*8u+b/4u);
+}
+
+/* Full-screen passes read the same few palette entries tens of thousands of
+ * times: convert each entry once, on first use (entries an image never uses
+ * are never read, exactly as before). */
+typedef struct { const PortableNativeImage *image; uint32_t color[256]; uint8_t known[256]; } ImageLookup;
+static inline void image_lookup_init(ImageLookup *lookup,const PortableNativeImage *image)
+{
+    lookup->image=image;
+    for(unsigned i=0u;i<256u;++i)lookup->known[i]=0u;
+}
+static inline uint32_t image_lookup_pixel(ImageLookup *lookup,size_t x,size_t y)
+{
+    const PortableNativeImage *image=lookup->image;
+    if(!image->palette)return image_pixel(image,x,y);
+    if(!image->pixels||x>=image->width||y>=image->height)return 0u;
+    const unsigned index=image->pixels[y*image->width+x];
+    if(index==255u)return 0u;
+    if(!lookup->known[index]){
+        const uint8_t *entry=image->palette+(index-image->palette_base)*2u;
+        const unsigned color=(unsigned)entry[0]|(unsigned)entry[1]<<8;
+        const unsigned r=color&31u,g=(color>>5u)&31u,b=(color>>10u)&31u;
+        lookup->color[index]=0xff000000u|(r*8u+r/4u)<<16u|(g*8u+g/4u)<<8u|(b*8u+b/4u);
+        lookup->known[index]=1u;
+    }
+    return lookup->color[index];
+}
+
 static PortableFrontendPresentationStatus draw_scaled_palette(
     const PortableAssetPackView *pack, uint32_t id, PortableSoftwareFrame *frame,
     int x, int y, int left, int top, int right, int bottom, unsigned scale,
@@ -84,13 +128,37 @@ PortableFrontendPresentationStatus portable_frontend_image_draw_affine(
     int bottom=(int)frame->height;if(bottom>160)bottom=160;
     int clipped_right=(int)frame->width;if(clipped_right>240)clipped_right=240;
     if(clipped_right>right)clipped_right=right;
-    for(int dy=0;dy<bottom*output_scale;++dy)
-    for(int dx=0;dx<clipped_right*output_scale;++dx){
+    /* Only target pixels within a circle around the pivot can sample inside
+     * the image: bound the scan by that circle's box instead of visiting the
+     * whole screen for every icon. The radius is the farthest image corner
+     * from the pivot, mapped through the inverse scale, with slack for the
+     * rounding below and for the sine table's unit error. */
+    int first_dx=0,first_dy=0,last_dx=clipped_right*output_scale,last_dy=bottom*output_scale;
+    {
+        int64_t farthest=0;
+        for(int corner=0;corner<4;++corner){
+            const int64_t u=(int64_t)image.anchor_x-pivot_x+((corner&1)?(int64_t)image.width:0);
+            const int64_t v=(int64_t)image.anchor_y-pivot_y+((corner&2)?(int64_t)image.height:0);
+            if(u*u+v*v>farthest)farthest=u*u+v*v;
+        }
+        int64_t radius=0;
+        while(radius*radius<farthest)++radius;
+        radius=((radius+3)*256*output_scale+inverse-1)/inverse;
+        radius+=radius/16+2*output_scale;
+        const int64_t center_x=(int64_t)(x+pivot_x)*output_scale,center_y=(int64_t)(y+pivot_y)*output_scale;
+        if(center_x-radius>first_dx)first_dx=(int)(center_x-radius);
+        if(center_y-radius>first_dy)first_dy=(int)(center_y-radius);
+        if(center_x+radius+1<last_dx)last_dx=(int)(center_x+radius+1);
+        if(center_y+radius+1<last_dy)last_dy=(int)(center_y+radius+1);
+    }
+    ImageLookup lookup;image_lookup_init(&lookup,&image);
+    for(int dy=first_dy;dy<last_dy;++dy)
+    for(int dx=first_dx;dx<last_dx;++dx){
         int rx=dx-(x+pivot_x)*output_scale,ry=dy-(y+pivot_y)*output_scale;
         int sx=pivot_x+portable_menu_asr15(((int64_t)rx*cosine+(int64_t)ry*sine)*inverse/(256*output_scale))-image.anchor_x;
         int sy=pivot_y+portable_menu_asr15((-(int64_t)rx*sine+(int64_t)ry*cosine)*inverse/(256*output_scale))-image.anchor_y;
         if(sx<0||sy<0||sx>=image.width||sy>=image.height)continue;
-        const uint32_t pixel=portable_native_image_pixel(&image,(unsigned)sx,(unsigned)sy);
+        const uint32_t pixel=image_lookup_pixel(&lookup,(unsigned)sx,(unsigned)sy);
         if((pixel>>24)==255u)portable_software_frame_store_physical(frame,(size_t)dx,(size_t)dy,pixel);
     }
     return PORTABLE_FRONTEND_PRESENTATION_OK;
@@ -111,7 +179,7 @@ PortableFrontendPresentationStatus portable_frontend_image_draw_atlas(
         int dx=x+(int)sx,dy=y+(int)sy;
         if(dx<left||dx>=right||dy<top||dy>=bottom||dx<0||dy<0||
            (size_t)dx>=frame->width||(size_t)dy>=frame->height)continue;
-        uint32_t pixel=portable_native_image_pixel(&image,sx,row*height+sy);
+        uint32_t pixel=image_pixel(&image,sx,row*height+sy);
         if((pixel>>24)==255u)portable_software_frame_store(frame,(size_t)dy*frame->width+(unsigned)dx,pixel);
     }
     return PORTABLE_FRONTEND_PRESENTATION_OK;
@@ -138,7 +206,7 @@ uint32_t portable_menu_background_layers_sample_at(const PortableMenuBackgroundL
         const unsigned row=layers->pattern->height==1792u?layers->pattern_row*256u:0u;
         const unsigned x=(unsigned)portable_software_frame_floor_div(physical_x,scale);
         const unsigned y=(unsigned)portable_software_frame_floor_div(physical_y,scale);
-        pixel=portable_native_image_pixel(layers->pattern,
+        pixel=image_pixel(layers->pattern,
             (x+(unsigned)layers->scroll_x)&255u,
             row+((y+(unsigned)layers->scroll_y)&255u));
     }
@@ -148,7 +216,7 @@ uint32_t portable_menu_background_layers_sample_at(const PortableMenuBackgroundL
         const int64_t ty=112*256*(int64_t)scale-layers->affine_b*x+layers->affine_a*y;
         const unsigned sx=(unsigned)portable_software_frame_floor_div(tx,256*(int64_t)scale)&255u;
         const unsigned sy=(unsigned)portable_software_frame_floor_div(ty,256*(int64_t)scale)&255u;
-        const uint32_t foreground=portable_native_image_pixel(layers->affine,sx,sy);
+        const uint32_t foreground=image_pixel(layers->affine,sx,sy);
         if(foreground>>24u==255u)pixel=foreground;
     }
     return pixel;
@@ -173,11 +241,12 @@ static PortableFrontendPresentationStatus pattern_row_draw(
     if(image.width!=256u||(image.height!=256u&&image.height!=256u*7u))return PORTABLE_FRONTEND_PRESENTATION_MISSING_SECTION;
     const unsigned top=image.height==256u?0u:(row%7u)*256u;
     const size_t center=frame->width>240u?(frame->width-240u)/2u:0u;
+    ImageLookup lookup;image_lookup_init(&lookup,&image);
     for(unsigned y=0;y<160u;++y)for(size_t x=0;x<frame->width;++x){
         /* Convert the centered source coordinate before wrapping: unsigned
          * division would give the wrong left-side phase at odd scales. */
         const unsigned source_x=(unsigned)((int64_t)x-(int64_t)center+offset_x)&255u;
-        uint32_t pixel=portable_native_image_pixel(&image,source_x,top+((y+(unsigned)offset_y)&255u));
+        uint32_t pixel=image_lookup_pixel(&lookup,source_x,top+((y+(unsigned)offset_y)&255u));
         if(pixel>>24!=255u)continue;
         if(!additive_blend){portable_software_frame_store(frame,(size_t)y*frame->width+x,pixel);continue;}
         /* Source BG0 blends8/16 over BG1 at16/16 in RGB555. */
@@ -244,6 +313,21 @@ PortableFrontendPresentationStatus portable_menu_background_render(
     const int width=(int)frame->width*output_scale;
     const int64_t center=(int64_t)(frame->width>240u?(frame->width-240u)/2u:0u)*output_scale;
     const int height=(int)(frame->height<160u?frame->height:160u)*output_scale;
+    if(output_scale==1){
+        /* Native sampling: the same affine map as layers_sample_at(), stepped
+         * in 32-bit (every term is far below 2^31) with one add per pixel. An
+         * arithmetic shift by 8 is the floor division by 256 used there. */
+        ImageLookup lookup;image_lookup_init(&lookup,&image);
+        for(int y=0;y<height;++y){
+            const int32_t rx=(int32_t)(0-center)-200,ry=y-80;
+            int32_t tx=96*256+layers.affine_a*rx+layers.affine_b*ry;
+            int32_t ty=112*256-layers.affine_b*rx+layers.affine_a*ry;
+            for(int x=0;x<width;++x,tx+=layers.affine_a,ty-=layers.affine_b){
+                const uint32_t pixel=image_lookup_pixel(&lookup,(unsigned)(tx>>8)&255u,(unsigned)(ty>>8)&255u);
+                if(pixel>>24==255u)portable_software_frame_store_physical(frame,(size_t)x,(size_t)y,pixel);
+            }
+        }
+    }else
     for(int y=0;y<height;++y)for(int x=0;x<width;++x){
         const uint32_t pixel=portable_menu_background_layers_sample_at(&layers,(int64_t)x-center,y,(unsigned)output_scale);
         if(pixel>>24==255u)portable_software_frame_store_physical(frame,(size_t)x,(size_t)y,pixel);
@@ -294,7 +378,7 @@ PortableFrontendPresentationStatus portable_frontend_heading_draw(
             const int sx=(int)portable_software_frame_floor_div((int64_t)(x-cell->x*scale)*cell->inverse_x,256*scale)-art.anchor_x;
             const int sy=(int)portable_software_frame_floor_div((int64_t)(y-cell->y*scale)*cell->inverse_y,256*scale)-art.anchor_y;
             if(sx<0||sy<0||(unsigned)sx>=art.width||(unsigned)sy>=art.height)continue;
-            const uint32_t pixel=portable_native_image_pixel(&art,(unsigned)sx,(unsigned)sy);
+            const uint32_t pixel=image_pixel(&art,(unsigned)sx,(unsigned)sy);
             if(pixel>>24u)portable_software_frame_store_physical(frame,(size_t)x,(size_t)y,pixel);
         }
     }

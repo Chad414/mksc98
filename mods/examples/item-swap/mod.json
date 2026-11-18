@@ -1,7 +1,0 @@
-{
-  "id": "item-swap",
-  "name": "Banana Swap",
-  "version": "1.0.0",
-  "api_version": 1,
-  "script": "main.lua"
-}

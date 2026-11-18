@@ -1673,7 +1673,13 @@ void portable_gp_host_event(PortableGpHost *host, const SDL_Event *input)
         !route_audio_horn(host->configuration.audio))
         host->error = 1;
     if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat &&
-        (event.key.scancode == SDL_SCANCODE_ESCAPE || event.key.scancode == SDL_SCANCODE_X))
+        (event.key.scancode == SDL_SCANCODE_ESCAPE || event.key.scancode == SDL_SCANCODE_X)
+#ifdef MKSC_WIN98
+        /* X is the port's "B" key: it must not drop a live race back to the
+         * menu. It still stops a replay; a race is left through the pause menu. */
+        && (event.key.scancode != SDL_SCANCODE_X || host->configuration.playback)
+#endif
+        )
     {
         if (host->configuration.quick_run && host->configuration.playback &&
             host->configuration.recording != NULL)

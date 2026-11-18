@@ -342,6 +342,17 @@ PortableAssetPackStatus portable_asset_pack_find_section(
 {
     if(pack==NULL||out==NULL||(pack->bytes==NULL&&pack->resolved_sections==NULL)||kind==0u||content_id==0u)
         return PORTABLE_ASSET_PACK_INVALID_ARGUMENT;
+    /* Renderers look sections up per draw call. In a plain (uncomposed) pack
+     * compare the two key words in place and decode only the matching entry,
+     * instead of decoding every table entry on the way. */
+    if(pack->resolved_sections==NULL)
+    {
+        const uint8_t *entry=section_entry(pack,0u);
+        for(uint32_t index=0;index<pack->section_count;++index,entry+=PORTABLE_ASSET_PACK_SECTION_SIZE)
+            if(read_u32(entry)==kind&&read_u32(entry+4)==content_id)
+                return portable_asset_pack_section_at(pack,index,out);
+        return PORTABLE_ASSET_PACK_NOT_FOUND;
+    }
     for(uint32_t index=0;index<pack->section_count;++index)
     {
         PortableAssetSectionView section;

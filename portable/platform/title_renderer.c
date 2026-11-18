@@ -200,7 +200,7 @@ PortableFrontendPresentationStatus portable_title_render(
         }
     }
 
-    if (flow->title_cursor>=4u) return PORTABLE_FRONTEND_PRESENTATION_INVALID_ARGUMENT;
+    if (flow->title_cursor>=PORTABLE_FRONTEND_TITLE_ROWS) return PORTABLE_FRONTEND_PRESENTATION_INVALID_ARGUMENT;
     if (flow->player_count_open) {
         /* Local player count in the link sub-menu frame: the spm N-P tab,
          * with the title's blinking arrows while more or fewer are possible. */
@@ -231,12 +231,13 @@ PortableFrontendPresentationStatus portable_title_render(
     }
     /* The native-only fourth row has no ROM label; it uses the menu font. */
     if (flow->title_cursor==3u) portable_menu_text_centered(pack,frame,120,124,"OPTIONS");
+    if (flow->title_cursor==4u) portable_menu_text_centered(pack,frame,120,124,"QUIT");
     if ((flow->tick&0x2fu)<=0x1fu) {
         if (flow->title_cursor>0u) {
             status=title_chrome_draw(pack,flow,PORTABLE_TITLE_UP,1u,frame,120,125,40,117,200,147);
             if (status!=PORTABLE_FRONTEND_PRESENTATION_OK) return status;
         }
-        if (flow->title_cursor<3u)
+        if (flow->title_cursor+1u<PORTABLE_FRONTEND_TITLE_ROWS)
             status=title_chrome_draw(pack,flow,PORTABLE_TITLE_DOWN,2u,frame,120,147,40,117,200,160);
     }
     return status;

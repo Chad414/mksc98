@@ -39,6 +39,12 @@ int portable_option_step(PortableSetting field, int old_value, int delta)
             if (aspects[i] == old_value)
                 index = i;
         value = aspects[(index + delta + 4) % 4];
+#ifdef MKSC_WIN98
+        /* Two choices in the Windows 98 port: the original 240x160 picture,
+         * or (stored as 0, upstream's "auto") the picture that fills the
+         * screen at a whole scale: wider and, in races, taller. */
+        value = old_value == 240 ? 0 : 240;
+#endif
     }
     return value;
 }
@@ -48,6 +54,13 @@ void portable_option_value_text(const PortableSettings *settings, PortableSettin
     const uint32_t number = portable_setting_get(settings, field);
     if (field == PORTABLE_SETTING_ASPECT_WIDTH)
     {
+#ifdef MKSC_WIN98
+        if (number == 240u)
+            snprintf(value, 24u, "ORIGINAL");
+        else if (number == 0u)
+            snprintf(value, 24u, "FILL");
+        else
+#endif
         if (number == 240u)
             snprintf(value, 24u, "3:2");
         else if (number == 284u)

@@ -11,6 +11,14 @@
 
 #define PORTABLE_FRONTEND_DRIVER_SLOTS 9u /* One 3x3 page; slot 4 is Random. */
 #define PORTABLE_FRONTEND_DRIVER_PAGES 8u /* Stock page plus seven roster pages. */
+/* Title menu rows: single player, multiplayer, ghost exchange and the
+ * native-only Options row. The Windows 98 port, which has no window frame
+ * in fullscreen, adds a fifth: Quit. */
+#ifdef MKSC_WIN98
+#define PORTABLE_FRONTEND_TITLE_ROWS 5u
+#else
+#define PORTABLE_FRONTEND_TITLE_ROWS 4u
+#endif
 #define PORTABLE_FRONTEND_DRIVER_CAPACITY \
     (PORTABLE_FRONTEND_DRIVER_SLOTS * PORTABLE_FRONTEND_DRIVER_PAGES)
 #define PORTABLE_FRONTEND_RANDOM_SLOT 4u

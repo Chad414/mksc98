@@ -54,6 +54,39 @@ static void game_shell_idle(void)
 
 /* Native options are a shell overlay: they do not advance game state or
  * append original frontend events while the player edits preferences. */
+#ifdef MKSC_WIN98
+/* The Windows 98 port lists only what does something there. Row 5 keeps the
+ * deadzone field's slot because that row is the door to the key bindings;
+ * with no controller it is shown as "KEY BINDINGS" and has no value to step. */
+static const PortableSetting option_fields[] = {PORTABLE_SETTING_WINDOW_SCALE,
+                                                PORTABLE_SETTING_FULLSCREEN,
+                                                PORTABLE_SETTING_FIT_SCALING,
+                                                PORTABLE_SETTING_ASPECT_WIDTH,
+                                                PORTABLE_SETTING_VOLUME,
+                                                PORTABLE_SETTING_DEADZONE,
+                                                PORTABLE_SETTING_SHORT_TRANSITIONS,
+                                                PORTABLE_SETTING_INPUT_DISPLAY,
+                                                PORTABLE_SETTING_MIRROR,
+                                                PORTABLE_SETTING_FIX_DOPPLER_WRAP};
+#define OPTION_LABELS \
+    "WINDOW SCALE", "FULLSCREEN", "DISPLAY SCALING", "ASPECT RATIO", "MASTER VOLUME", \
+    "KEY BINDINGS", "FAST MENUS", "INPUT DISPLAY", "MIRROR MODE", "FIX DOPPLER BUG"
+#define OPTION_FOOTER_BINDINGS "Z/ENTER EDIT KEYS - X BACK"
+#define OPTION_FOOTER "X BACK - CHANGES SAVE AUTOMATICALLY"
+/* The Enhancements, Mods and in-race Graphics pages hold only features this
+ * port leaves out, so they are not reachable. */
+#define SHELL_EXTRA_PAGES 0
+#define SHELL_GRAPHICS_HOOK(shell) {0}
+#else
+#define OPTION_LABELS \
+        "WINDOW SCALE",  "FULLSCREEN",     "VSYNC",           "FILTER", \
+        "MASTER VOLUME", "STICK DEADZONE", "FAST MENUS",      "INTERPOLATION", \
+        "RENDER FPS",    "INTERNAL SCALE", "DISPLAY SCALING", "ASPECT RATIO", \
+        "RUMBLE",        "INPUT DISPLAY",  "MIRROR MODE",     "FIX DOPPLER BUG", "TOUCH CONTROLS"
+#define OPTION_FOOTER_BINDINGS "A/ENTER EDIT BINDINGS - B/ESC BACK"
+#define OPTION_FOOTER "B/ESC BACK - CHANGES SAVE AUTOMATICALLY"
+#define SHELL_EXTRA_PAGES 1
+#define SHELL_GRAPHICS_HOOK(shell) {shell, game_shell_graphics_current, game_shell_graphics_edit}
 static const PortableSetting option_fields[] = {PORTABLE_SETTING_WINDOW_SCALE,
                                                 PORTABLE_SETTING_FULLSCREEN,
                                                 PORTABLE_SETTING_VSYNC,
@@ -71,6 +104,7 @@ static const PortableSetting option_fields[] = {PORTABLE_SETTING_WINDOW_SCALE,
                                                 PORTABLE_SETTING_MIRROR,
                                                 PORTABLE_SETTING_FIX_DOPPLER_WRAP,
                                                 PORTABLE_SETTING_TOUCH_CONTROLS};
+#endif
 enum
 {
     OPTION_ROWS = sizeof option_fields / sizeof option_fields[0]
@@ -78,11 +112,7 @@ enum
 static void render_settings(const PortableAssetPackView *pack, PortableSoftwareFrame *frame,
                             const PortableSettings *settings, unsigned cursor, const char *notice)
 {
-    static const char *const labels[OPTION_ROWS] = {
-        "WINDOW SCALE",  "FULLSCREEN",     "VSYNC",           "FILTER",
-        "MASTER VOLUME", "STICK DEADZONE", "FAST MENUS",      "INTERPOLATION",
-        "RENDER FPS",    "INTERNAL SCALE", "DISPLAY SCALING", "ASPECT RATIO",
-        "RUMBLE",        "INPUT DISPLAY",  "MIRROR MODE",     "FIX DOPPLER BUG", "TOUCH CONTROLS"};
+    static const char *const labels[OPTION_ROWS] = {OPTION_LABELS};
     const unsigned first = cursor >= PORTABLE_OPTION_PAGE_ROWS ? cursor - PORTABLE_OPTION_PAGE_ROWS + 1u : 0u;
     portable_option_page(pack, frame, "OPTIONS", first, PORTABLE_OPTION_PAGE_ROWS, OPTION_ROWS);
     for (unsigned line = 0u; line < PORTABLE_OPTION_PAGE_ROWS; ++line)
@@ -91,13 +121,16 @@ static void render_settings(const PortableAssetPackView *pack, PortableSoftwareF
         const PortableSetting field = option_fields[row];
         char value[24];
         portable_option_value_text(settings, field, value);
+#ifdef MKSC_WIN98
+        if (field == PORTABLE_SETTING_DEADZONE) value[0] = '\0'; /* the key bindings row */
+#endif
         portable_option_row(pack, frame, line, row == cursor, labels[row], value);
     }
     portable_menu_text_wrapped(pack, frame, 12, PORTABLE_OPTION_FOOTER_Y, 27u, PORTABLE_OPTION_ROW_STEP, 2u,
                                notice != NULL ? notice
                                : cursor == PORTABLE_SETTING_DEADZONE
-                                   ? "A/ENTER EDIT BINDINGS - B/ESC BACK"
-                                   : "B/ESC BACK - CHANGES SAVE AUTOMATICALLY");
+                                   ? OPTION_FOOTER_BINDINGS
+                                   : OPTION_FOOTER);
 }
 
 static void render_enhancements(const PortableAssetPackView *pack,PortableSoftwareFrame *frame,
@@ -172,8 +205,14 @@ static unsigned effects_preset(const PortableSettings *settings)
 /* Binding rows: player 1 keys, player 2 keys, then gamepad buttons. */
 enum
 {
+#ifdef MKSC_WIN98
+    /* One keyboard player, no controller: just the eight player 1 keys. */
+    BINDING_ROWS = 8u,
+    BINDING_KEY_ROWS = 8u
+#else
     BINDING_ROWS = 20u,
     BINDING_KEY_ROWS = 16u
+#endif
 };
 static PortableSetting binding_field(unsigned row)
 {
@@ -232,9 +271,14 @@ static void render_bindings(const PortableAssetPackView *pack, PortableSoftwareF
     portable_menu_text_wrapped(pack, frame, 12, PORTABLE_OPTION_FOOTER_Y, 27u, PORTABLE_OPTION_ROW_STEP, 2u,
                                notice != NULL ? notice
                                : capturing
+#ifdef MKSC_WIN98
+                                   ? "PRESS THE NEW KEY"
+                                   : "Z/ENTER CHANGE - TAB RESET - X BACK");
+#else
                                    ? (cursor < BINDING_KEY_ROWS ? "PRESS A KEY - ESC CANCEL"
                                                                 : "PRESS PAD BUTTON - START CANCEL")
                                    : "B/ESC BACK - SELECT/TAB RESET THIS BINDING");
+#endif
 }
 
 /* The modern menus animate their own entrances, so they skip the original
@@ -3365,7 +3409,7 @@ static void game_shell_poll_events(GameShell *shell)
         }
         if (event.type == SDL_EVENT_KEY_DOWN || event.type == SDL_EVENT_KEY_UP)
             frontend_keyboard_event(&event.key, &shell->keyboard_buttons, &shell->keyboard_pressed);
-        if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat && event.key.key == SDLK_F5 && !shell->store_open &&
+        if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat && event.key.key == SDLK_F5 && SHELL_EXTRA_PAGES && !shell->store_open &&
             !shell->binding_capture && shell->mod_dialog == NULL && !shell->mod_unsaved_open &&
             !portable_course_3d_host_active(shell->preview_3d) &&
             shell->options_open != 5) {
@@ -4421,7 +4465,7 @@ static GameShellMenuTick game_shell_tick_settings(GameShell *shell, uint16_t but
         }
         shell->mesh_driving_pressed = 0u;
         portable_course_3d_host_set_graphics(shell->preview_3d,
-            (PortableGraphicsHook){shell, game_shell_graphics_current, game_shell_graphics_edit});
+            (PortableGraphicsHook)SHELL_GRAPHICS_HOOK(shell));
         if (!mesh_request)
             portable_course_3d_host_show(shell->preview_3d);
         else if (!portable_course_3d_host_launch(shell->preview_3d, course, explore))
@@ -4446,6 +4490,20 @@ static GameShellMenuTick game_shell_tick_settings(GameShell *shell, uint16_t but
         shell->options_cursor = 0u;
         shell->options_notice = NULL;
     }
+#ifdef MKSC_WIN98
+    /* The port's fifth title row: leave the game the same way the window's
+     * close button does (saves are already written as they change). */
+    if (!shell->options_open && shell->aid == NULL &&
+        shell->flow.page == PORTABLE_FRONTEND_PAGE_TITLE_MENU &&
+        shell->flow.transition_ticks == 0u &&
+        (shell->flow.short_transitions || shell->flow.page_ticks > 69u) &&
+        shell->flow.title_cursor == 4u &&
+        (pressed & (PORTABLE_FRONTEND_BUTTON_A | PORTABLE_FRONTEND_BUTTON_START)))
+    {
+        game_shell_mod_exit(shell, 3u);
+        return GAME_SHELL_TICK_OPTIONS;
+    }
+#endif
     /* The modern options show their pages as tabs: L and R switch between them. */
     if (((shell->options_open >= 1 && shell->options_open <= 4)||shell->options_open==7) && !shell->binding_capture &&
         shell->game_import==NULL &&
@@ -4574,7 +4632,7 @@ static GameShellMenuTick game_shell_tick_settings(GameShell *shell, uint16_t but
                 shell->options_notice = portable_ui_background_host_notice(&shell->ui_background);
             }
         }
-        else if (pressed & PORTABLE_FRONTEND_BUTTON_SELECT)
+        else if (SHELL_EXTRA_PAGES && (pressed & PORTABLE_FRONTEND_BUTTON_SELECT))
         {
             shell->options_open = 3;
             shell->enhancements_cursor=0u;
@@ -4606,7 +4664,10 @@ static GameShellMenuTick game_shell_tick_settings(GameShell *shell, uint16_t but
             const PortableSetting field = option_fields[shell->options_cursor];
             const int delta = (pressed & PORTABLE_FRONTEND_BUTTON_LEFT) ? -1 : 1;
             const int old = (int)portable_setting_get(&shell->settings, field);
-            const int value = portable_option_step(field, old, delta);
+            int value = portable_option_step(field, old, delta);
+#ifdef MKSC_WIN98
+            if (field == PORTABLE_SETTING_DEADZONE) value = -1; /* the key bindings row has nothing to step */
+#endif
             if (value >= 0)
                 (void)game_shell_commit_setting(shell, field, (uint32_t)value, &shell->options_notice);
         }
@@ -5124,7 +5185,7 @@ static GameShellLaunch game_shell_begin_race(GameShell *shell)
                                         shell->settings.aspect_width,
                                         shell->settings.render_fps,
                                         shell->settings.interpolate,
-                                        {shell, game_shell_graphics_current, game_shell_graphics_edit}};
+                                        SHELL_GRAPHICS_HOOK(shell)};
         for (unsigned player = 0u; player < shell->flow.players; ++player)
             multi.characters[player] = shell->flow.player_characters[player];
         if (!route_audio_begin_race(
@@ -5292,7 +5353,7 @@ static GameShellLaunch game_shell_begin_race(GameShell *shell)
                 (uint8_t)!shell->settings.classic_menus,
                 shell->settings.artwork_lod,
                 shell->settings.race_renderer,
-                {shell, game_shell_graphics_current, game_shell_graphics_edit}};
+                SHELL_GRAPHICS_HOOK(shell)};
             if (shell->aid != NULL)
             {
                 printf("%s menu launch: cup=%u class=%u track=%u course=%u credits=%u\n",
@@ -5354,7 +5415,7 @@ static GameShellLaunch game_shell_begin_race(GameShell *shell)
         shell->selected_trial->scene.save_directory =
             shell->aid != NULL ? shell->aid->save_directory : NULL;
         shell->selected_trial->scene.scripts = shell->scripts;
-        shell->selected_trial->scene.graphics = (PortableGraphicsHook){shell, game_shell_graphics_current, game_shell_graphics_edit};
+        shell->selected_trial->scene.graphics = (PortableGraphicsHook)SHELL_GRAPHICS_HOOK(shell);
         shell->selected_trial->host = portable_time_trial_host_begin(&shell->selected_trial->scene);
         if (shell->selected_trial->host == NULL)
         {
@@ -5371,12 +5432,12 @@ static GameShellLaunch game_shell_begin_race(GameShell *shell)
 
 static void modern_options(const GameShell *shell, ModernMenuOptions *options)
 {
-    static const char *const labels[OPTION_ROWS] = {
+    static const char *const labels[] = {
         "Window Scale",  "Fullscreen",     "VSync",          "Filter",
         "Master Volume", "Stick Deadzone", "Fast Menus",     "Interpolation",
         "Render FPS",    "Internal Scale", "Display Scaling", "Aspect Ratio",
         "Rumble",        "Input Display",  "Mirror Mode",    "Fix Doppler Bug", "Touch Controls"};
-    static const char *const help[OPTION_ROWS] = {
+    static const char *const help[] = {
         "Window size as a multiple of the original 240x160 screen.",
         "Fill the whole display.",
         "Sync presentation to the display to avoid tearing.",

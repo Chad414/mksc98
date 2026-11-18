@@ -28,7 +28,14 @@ typedef struct
 } PortableSoftwareFrame;
 
 static inline size_t portable_software_frame_scale(const PortableSoftwareFrame *frame)
+#ifdef PORTABLE_SOFTWARE_FRAME_NATIVE_ONLY
+/* Builds that only ever render at the native 240x160 sampling (internal
+ * scale 1) make the scale a constant, so every per-pixel multiply and
+ * 64-bit divide by it folds away in the renderers. */
+{ (void)frame; return 1u; }
+#else
 { return frame->scale>1u?frame->scale:1u; }
+#endif
 static inline size_t portable_software_frame_pixel_count(const PortableSoftwareFrame *frame)
 { const size_t scale=portable_software_frame_scale(frame);return frame->width*frame->height*scale*scale; }
 static inline size_t portable_software_frame_stride(const PortableSoftwareFrame *frame)

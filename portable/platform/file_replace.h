@@ -11,7 +11,12 @@
 static inline int portable_file_replace(const char *temporary,const char *path)
 {
     if(temporary==NULL||path==NULL)return 0;
-#ifdef _WIN32
+#if defined(_WIN32) && defined(MKSC_WIN98)
+    /* Windows 9x exports MoveFileExA only as a stub that always fails. A
+     * plain move works for a first save; otherwise replace in two steps. */
+    if(MoveFileA(temporary,path))return 1;
+    return DeleteFileA(path)&&MoveFileA(temporary,path);
+#elif defined(_WIN32)
     return MoveFileExA(temporary,path,MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH)!=0;
 #else
     return rename(temporary,path)==0;
